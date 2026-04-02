@@ -1,27 +1,55 @@
-# KOReader Highlight Refresh Patch
+# KOReader User Patches
 
-## At a glance
+## Patch Catalog
+
+This repository currently contains the following user patches:
+
+1. `2-highlight-refresh.lua`
+Fixes delayed highlight realignment after layout/render changes.
+Without this patch, highlights can remain visually misaligned for about
+10-15 seconds before settling.
+
+2. `2-kobo-style-screensaver.lua`
+Adds a Kobo-style screensaver layout (cover + reading info + optional quote)
+and includes a rotation fix so cover/layout math is built in portrait when
+needed.
+
+## Quick Start (All Patches)
+
+1. Copy the desired patch file(s) into `koreader/patches/`.
+2. Open KOReader Patch Manager.
+3. Enable the patch(es).
+4. Restart KOReader.
+
+---
+
+## Patch Deep Dive: Highlight Refresh (`2-highlight-refresh.lua`)
+
+### At a glance
 
 This patch fixes delayed highlight correction after layout/render changes.
 
-- Before: highlights can stay visibly misaligned, and in practice may take around 10-15 seconds to settle into the correct position.
-- After: cache reset is triggered in the draw path as soon as render context changes are detected.
+- Before: highlights can stay visibly misaligned, and in practice may take
+  around 10-15 seconds to settle into the correct position.
+- After: cache reset is triggered in the draw path as soon as render context
+  changes are detected.
 
-## User guide
+### User guide
 
-### What this patch improves
+#### What this patch improves
 
 - Highlights realign faster after reflow-related changes.
 - Less time with stale highlight box positions.
 
-### Installation
+#### Installation
 
-1. Place the patch file in `koreader/patches/` (for example `2-highlight-refresh.lua`).
+1. Place the patch file in `koreader/patches/` (for example
+   `2-highlight-refresh.lua`).
 2. Open KOReader Patch Manager.
 3. Enable the patch.
 4. Restart KOReader.
 
-### Optional debug logs
+#### Optional debug logs
 
 - Set `PATCH_DEBUG = true` in the patch file.
 - Logs are appended to `/tmp/patch.log`.
@@ -32,22 +60,23 @@ This patch fixes delayed highlight correction after layout/render changes.
   - `refresh_triggered`
   - `skip_no_change`
 
-## Developer notes
+### Developer notes
 
-### Hook strategy
+#### Hook strategy
 
 - Wrap `ReaderUI.registerModule`.
 - When module name is `view`, call `hook_view(self)`.
-- Keep a fallback `UIManager:nextTick(...)` path: `hook_view(ReaderUI.instance or UIManager:getTopWidget())`.
+- Keep a fallback `UIManager:nextTick(...)` path:
+  `hook_view(ReaderUI.instance or UIManager:getTopWidget())`.
 
-### Wrapped methods
+#### Wrapped methods
 
 - `drawPageView`
 - `drawScrollView`
 
 Each wrapper calls `refresh_highlights(self)` before the original draw call.
 
-### Core logic
+#### Core logic
 
 - `get_render_key(ui)`:
   - Uses cached method refs from `hook_view`.
@@ -58,28 +87,29 @@ Each wrapper calls `refresh_highlights(self)` before the original draw call.
   - Reads render key and compares with `_last_render_hash`.
   - On change: increments `_hr_epoch`.
   - Skips when `_hr_applied_epoch == _hr_epoch`.
-  - Otherwise calls cached `resetHighlightBoxesCache` and updates `_hr_applied_epoch`.
+  - Otherwise calls cached `resetHighlightBoxesCache` and updates
+    `_hr_applied_epoch`.
 
 - `hook_view(ui)`:
   - Validates required objects/functions.
   - Caches function references on `ui`.
   - Installs wrappers once via `_highlight_refresh_hooked`.
 
-### Runtime state
+#### Runtime state
 
 - `_last_render_hash`: last render key.
 - `_hr_epoch`: generation counter for render-key changes.
 - `_hr_applied_epoch`: last generation already refreshed.
 - `_highlight_refresh_hooked`: prevents duplicate wrapping.
 
-### Performance
+#### Performance
 
 - O(1) checks in render path.
 - No text scanning or heavy processing.
 - One cache reset per generation change.
 - Cached function refs reduce hot-path lookup overhead.
 
-## Execution flow
+### Execution flow
 
 1. Patch file loads.
 2. `ReaderUI.registerModule` is wrapped.
@@ -90,7 +120,7 @@ Each wrapper calls `refresh_highlights(self)` before the original draw call.
 7. If current epoch is already applied, skip.
 8. Else run `resetHighlightBoxesCache` and mark epoch applied.
 
-## Execution flow diagram
+### Execution flow diagram
 
 ```mermaid
 flowchart TD
@@ -124,8 +154,57 @@ flowchart TD
     T --> Z
 ```
 
-## Limitations
+### Limitations
 
-- Requires `ui.view` with `drawPageView`, `drawScrollView`, and `resetHighlightBoxesCache`.
-- Depends on KOReader internal method names; updates may require patch adjustments.
-- Render-key detection depends on `getDocumentRenderingHash` or `getCurrentPage` availability.
+- Requires `ui.view` with `drawPageView`, `drawScrollView`, and
+  `resetHighlightBoxesCache`.
+- Depends on KOReader internal method names; updates may require patch
+  adjustments.
+- Render-key detection depends on `getDocumentRenderingHash` or
+  `getCurrentPage` availability.
+
+---
+
+## Patch Deep Dive: Kobo-Style Screensaver (`2-kobo-style-screensaver.lua`)
+
+### What it does
+
+- Adds Kobo-style screensaver rendering using current/last book data.
+- Integrates a settings/menu entry for Kobo-style mode.
+
+### Modification context
+
+- Adapted from `PedroMachado1/Koreader.patches`.
+- This repository contains a modified variant.
+- Rotation-related modification is reflected in commit:
+  `9768f2e29fbafaa3b8e120f618b7b12a12ec522a`.
+
+### Original behavior before modification
+
+- Kobo-style widget build could use current rotation.
+- In landscape, cover/layout calculations could crop or place elements
+  incorrectly.
+
+### Fix in this modified version
+
+- Hooks `Screensaver.show`.
+- For `screensaver_type == "kobo_style"`:
+  - reads current rotation via `Screen:getRotationMode`
+  - if landscape (`rotation_mode % 2 == 1`), stores
+    `Device.orig_rotation_mode`, switches to portrait with
+    `Screen:setRotationMode(Screen.DEVICE_ROTATED_UPRIGHT)`
+  - builds widget
+  - restores rotation on:
+    - early return path when widget build fails
+    - screensaver close via `ScreenSaverWidget.onCloseWidget` override
+
+### Behavior after fix
+
+- Widget/cover layout is built with portrait math.
+- Landscape no longer drives incorrect cover crop/layout path.
+- Previous rotation is restored after screensaver exits.
+
+### Credits
+
+- Original patch: `PedroMachado1/Koreader.patches`
+- Modifications: `Dark-Matter7232`
