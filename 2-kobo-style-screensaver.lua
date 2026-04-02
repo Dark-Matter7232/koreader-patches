@@ -16,7 +16,6 @@ local VerticalSpan = require("ui/widget/verticalspan")
 local DataStorage = require("datastorage")
 local SQ3 = require("lua-ljsqlite3/init")
 local lfs = require("libs/libkoreader-lfs")
-local bit = require("bit")
 local util = require("util")
 local _ = require("gettext")
 
@@ -1055,10 +1054,32 @@ end
 
 local Screensaver = require("ui/screensaver")
 local orig_screensaver_show = Screensaver.show
+local orig_screensaverwidget_onCloseWidget = ScreenSaverWidget.onCloseWidget
+
+ScreenSaverWidget.onCloseWidget = function(self)
+    if Device.orig_rotation_mode then
+        Screen:setRotationMode(Device.orig_rotation_mode)
+        Device.orig_rotation_mode = nil
+    end
+
+    if orig_screensaverwidget_onCloseWidget then
+        return orig_screensaverwidget_onCloseWidget(self)
+    end
+end
 
 Screensaver.show = function(self)
     if self.screensaver_type ~= "kobo_style" then
         return orig_screensaver_show(self)
+    end
+
+    local rotation_mode = Screen:getRotationMode()
+    local rotated_to_portrait = false
+    if rotation_mode % 2 == 1 then
+        Device.orig_rotation_mode = rotation_mode
+        Screen:setRotationMode(Screen.DEVICE_ROTATED_UPRIGHT)
+        rotated_to_portrait = true
+    else
+        Device.orig_rotation_mode = nil
     end
 
     local ui = self.ui or ReaderUI.instance
@@ -1082,6 +1103,10 @@ Screensaver.show = function(self)
     end
     
     if not receipt_widget then
+        if rotated_to_portrait then
+            Screen:setRotationMode(rotation_mode)
+            Device.orig_rotation_mode = nil
+        end
         return orig_screensaver_show(self)
     end
 
@@ -1091,14 +1116,6 @@ Screensaver.show = function(self)
     end
 
     Device.screen_saver_mode = true
-
-    local rotation_mode = Screen:getRotationMode()
-    Device.orig_rotation_mode = rotation_mode
-    if bit.band(rotation_mode, 1) == 1 then
-        Screen:setRotationMode(Screen.DEVICE_ROTATED_UPRIGHT)
-    else
-        Device.orig_rotation_mode = nil
-    end
 
     self.screensaver_widget = ScreenSaverWidget:new{
         widget = receipt_widget,
