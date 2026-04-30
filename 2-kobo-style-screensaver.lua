@@ -17,12 +17,48 @@ local DataStorage = require("datastorage")
 local SQ3 = require("lua-ljsqlite3/init")
 local lfs = require("libs/libkoreader-lfs")
 local util = require("util")
-local _ = require("gettext")
-
 local Screen = Device.screen
 
 -- Constantes
 local STATISTICS_DB_PATH = DataStorage:getSettingsDir() .. "/statistics.sqlite3"
+math.randomseed(os.time())
+
+local metadata_file_cache = {}
+local metadata_cache = {}
+local highlight_cache = {}
+local cover_bb_cache = setmetatable({}, { __mode = "v" })
+local today_duration_cache = {}
+local statistics_db_state = {}
+local FileManagerBookInfo = nil
+
+local ok_table_new, table_new = pcall(require, "table.new")
+if not ok_table_new then
+    table_new = nil
+end
+
+local METADATA_FILENAMES = {
+    "metadata.lua",
+    "metadata.epub.lua",
+    "metadata.pdf.lua",
+    "metadata.mobi.lua",
+    "metadata.azw3.lua",
+    "metadata.azw.lua",
+    "metadata.fb2.lua",
+    "metadata.cbz.lua",
+    "metadata.txt.lua",
+    "metadata.html.lua",
+    "metadata.htm.lua",
+}
+
+local TODAY_DURATION_SQL = [[SELECT sum(sum_duration) AS total_duration
+    FROM (
+        SELECT sum(duration) AS sum_duration
+        FROM page_stat
+        WHERE start_time >= ? AND id_book = ?
+        GROUP BY page
+    );
+]]
+local TODAY_DURATION_CACHE_TTL = 60
 
 -- Chaves de configuração
 local SETTINGS = {
@@ -70,8 +106,6 @@ local DEFAULTS = {
     SHOW_CHAPTER = true,
     SHOW_PROGRESS = true,
     SHOW_TIME_LEFT = true,
-    SHOW_TODAY_TIME = true,
-    SHOW_COVER = true,
     SHOW_TODAY_TIME = true,
     SHOW_COVER = true,
     SHOW_PAGES = false,
@@ -261,6 +295,29 @@ local function T(key)
     return translations[key] or key
 end
 
+local function getTranslations()
+    local lang = getCurrentLanguage()
+    return TRANSLATIONS[lang] or TRANSLATIONS["pt"]
+end
+
+local function translate(translations, key)
+    return translations[key] or key
+end
+
+local function newArray(narray, nhash)
+    if table_new then
+        return table_new(narray or 0, nhash or 0)
+    end
+    return {}
+end
+
+local function getFileSignature(path)
+    if not path then return nil end
+    local attrs = lfs.attributes(path)
+    if not attrs then return nil end
+    return string.format("%s:%s:%s", tostring(attrs.mode), tostring(attrs.modification), tostring(attrs.size))
+end
+
 -- ============================================================================
 -- FUNÇÕES AUXILIARES
 -- ============================================================================
@@ -289,22 +346,6 @@ local function truncateAtColon(title)
     return title
 end
 
--- Conta caracteres UTF-8
-local function utf8Len(str)
-    if not str or str == "" then return 0 end
-    local len = 0
-    local i = 1
-    while i <= #str do
-        local byte = string.byte(str, i)
-        if byte >= 0xF0 then i = i + 4
-        elseif byte >= 0xE0 then i = i + 3
-        elseif byte >= 0xC0 then i = i + 2
-        else i = i + 1 end
-        len = len + 1
-    end
-    return len
-end
-
 -- Corta string UTF-8 com limite de caracteres
 local function utf8Sub(str, max_chars)
     if not str or str == "" or max_chars <= 0 then return "" end
@@ -331,41 +372,89 @@ local function hasActiveDocument(ui)
 end
 
 -- Formata duração em horas/minutos
-local function formatDuration(secs)
+local function formatDuration(secs, translations)
     if not secs or secs <= 0 then return nil end
     local h = math.floor(secs / 3600)
     local m = math.floor((secs % 3600) / 60)
     if h > 0 and m > 0 then
-        return string.format(T("duration_hm"), h, m)
+        return string.format(translate(translations, "duration_hm"), h, m)
     elseif h > 0 then
-        return string.format(T("duration_h"), h)
+        return string.format(translate(translations, "duration_h"), h)
     elseif m > 0 then
-        return string.format(T("duration_m"), m)
+        return string.format(translate(translations, "duration_m"), m)
     else
-        return T("duration_less")
+        return translate(translations, "duration_less")
     end
 end
 
 -- Formata tempo restante
-local function formatTimeLeft(avg_time, pages_left)
+local function formatTimeLeft(avg_time, pages_left, translations)
     if not avg_time or avg_time <= 0 or not pages_left then return nil end
     local secs = avg_time * pages_left
     local h = math.floor(secs / 3600)
     local m = math.floor((secs % 3600) / 60)
     if h > 0 and m > 0 then
-        return string.format(T("time_left_hm"), h, m)
+        return string.format(translate(translations, "time_left_hm"), h, m)
     elseif h > 0 then
-        return string.format(T("time_left_h"), h)
+        return string.format(translate(translations, "time_left_h"), h)
     elseif m > 0 then
-        return string.format(T("time_left_m"), m)
+        return string.format(translate(translations, "time_left_m"), m)
     else
-        return T("time_left_less")
+        return translate(translations, "time_left_less")
     end
 end
 
 -- ============================================================================
 -- FUNÇÕES DE BANCO DE DADOS
 -- ============================================================================
+
+local function closeStatisticsDb()
+    local stmt = statistics_db_state.stmt
+    local conn = statistics_db_state.conn
+    if stmt then
+        pcall(stmt.close, stmt)
+    end
+    if conn then
+        pcall(conn.close, conn)
+    end
+    statistics_db_state.conn = nil
+    statistics_db_state.stmt = nil
+    statistics_db_state.signature = nil
+end
+
+local function getTodayStart(now_stamp)
+    local now_t = os.date("*t", now_stamp)
+    local from_begin_day = now_t.hour * 3600 + now_t.min * 60 + now_t.sec
+    return now_stamp - from_begin_day
+end
+
+local function getTodayDurationStmt()
+    local db_signature = getFileSignature(STATISTICS_DB_PATH)
+    if not db_signature then
+        closeStatisticsDb()
+        return nil
+    end
+
+    if statistics_db_state.conn and statistics_db_state.stmt and statistics_db_state.signature == db_signature then
+        return statistics_db_state.stmt
+    end
+
+    closeStatisticsDb()
+
+    local conn = SQ3.open(STATISTICS_DB_PATH)
+    if not conn then return nil end
+
+    local stmt = conn:prepare(TODAY_DURATION_SQL)
+    if not stmt then
+        conn:close()
+        return nil
+    end
+
+    statistics_db_state.conn = conn
+    statistics_db_state.stmt = stmt
+    statistics_db_state.signature = db_signature
+    return stmt
+end
 
 -- Obtém tempo de leitura de hoje pelo ID do livro
 local function getBookTodayDurationById(id_book)
@@ -376,43 +465,41 @@ local function getBookTodayDurationById(id_book)
     if attrs ~= "file" then return nil end
     
     local now_stamp = os.time()
-    local now_t = os.date("*t", now_stamp)
-    local from_begin_day = now_t.hour * 3600 + now_t.min * 60 + now_t.sec
-    local start_today_time = now_stamp - from_begin_day
-    
-    local ok_conn, conn = pcall(SQ3.open, STATISTICS_DB_PATH)
-    if not ok_conn or not conn then return nil end
-    
-    local sql_stmt = string.format([[SELECT sum(sum_duration)
-        FROM (
-            SELECT sum(duration) AS sum_duration
-            FROM page_stat
-            WHERE start_time >= %d AND id_book = %d
-            GROUP BY page
-        );
-    ]], start_today_time, id_book)
-    
-    local ok_row, today_duration = pcall(function()
-        return conn:rowexec(sql_stmt)
-    end)
-    conn:close()
-    
-    if not ok_row or today_duration == nil then return nil end
+    local start_today_time = getTodayStart(now_stamp)
+    local cache_key = tostring(id_book)
+    local cached = today_duration_cache[cache_key]
+    if cached and cached.start_today_time == start_today_time and (now_stamp - cached.timestamp) < TODAY_DURATION_CACHE_TTL then
+        return cached.value
+    end
+
+    local stmt = getTodayDurationStmt()
+    if not stmt then return nil end
+
+    local row = stmt:reset():bind(start_today_time, id_book):step(newArray(1, 1))
+    local today_duration = row and (row.total_duration or row[1]) or nil
     today_duration = tonumber(today_duration)
     if not today_duration or today_duration <= 0 then return nil end
+    today_duration_cache[cache_key] = {
+        start_today_time = start_today_time,
+        timestamp = now_stamp,
+        value = today_duration,
+    }
     return today_duration
 end
 
 -- Obtém tempo de leitura de hoje usando o objeto statistics
 local function getBookTodayDuration(statistics)
     if not statistics then return nil end
-    if statistics.isEnabled and not statistics:isEnabled() then return nil end
-    if statistics.insertDB then pcall(statistics.insertDB, statistics) end
+    if type(statistics.isEnabled) == "function" and not statistics:isEnabled() then return nil end
 
     local id_book = statistics.id_curr_book
-    if (not id_book) and statistics.getIdBookDB then
-        local ok, book_id = pcall(statistics.getIdBookDB, statistics)
-        if ok then id_book = book_id end
+    if (not id_book) and type(statistics.getIdBookDB) == "function" then
+        id_book = statistics:getIdBookDB()
+    end
+
+    if not id_book then return nil end
+    if type(statistics.insertDB) == "function" then
+        statistics:insertDB()
     end
     
     return getBookTodayDurationById(id_book)
@@ -440,7 +527,7 @@ local function collectCurrentBookData(ui, state)
     
     local doc_props = ui.doc_props or {}
     local book_title = truncateAtColon(doc_props.display_title or "") or ""
-    if book_title == "" then book_title = "Sem título" end
+    if book_title == "" then book_title = T("no_title") end
     
     local doc_page_no = (state and state.page) or 1
     
@@ -448,11 +535,7 @@ local function collectCurrentBookData(ui, state)
     local chapter_title = ""
     
     if toc then
-        chapter_title = toc:getTocTitleByPage(doc_page_no) or ""
-        local colon_pos = chapter_title:find(":")
-        if colon_pos then
-            chapter_title = util.trim(chapter_title:sub(1, colon_pos - 1))
-        end
+        chapter_title = truncateAtColon(toc:getTocTitleByPage(doc_page_no) or "")
     end
     
     local doc_settings = ui.doc_settings and ui.doc_settings.data or {}
@@ -508,6 +591,16 @@ end
 -- Encontra o arquivo de metadados do livro
 local function findMetadataFile(book_path)
     if not book_path then return nil end
+
+    local cache_key = book_path
+    local book_signature = getFileSignature(book_path)
+    local cached = metadata_file_cache[cache_key]
+    if cached and cached.book_signature == book_signature then
+        local metadata_signature = cached.path and getFileSignature(cached.path) or nil
+        if cached.metadata_signature == metadata_signature then
+            return cached.path
+        end
+    end
     
     -- A pasta .sdr usa o nome do arquivo SEM a extensão
     local base_path = getBookBasePath(book_path)
@@ -515,28 +608,25 @@ local function findMetadataFile(book_path)
     
     -- Verifica se o diretório .sdr existe
     local sdr_attrs = lfs.attributes(sdr_path, "mode")
-    if sdr_attrs ~= "directory" then return nil end
-    
-    -- Lista de possíveis nomes de arquivos de metadados
-    local possible_files = {
-        "metadata.lua",
-        "metadata.epub.lua",
-        "metadata.pdf.lua",
-        "metadata.mobi.lua",
-        "metadata.azw3.lua",
-        "metadata.azw.lua",
-        "metadata.fb2.lua",
-        "metadata.cbz.lua",
-        "metadata.txt.lua",
-        "metadata.html.lua",
-        "metadata.htm.lua",
-    }
+    if sdr_attrs ~= "directory" then
+        metadata_file_cache[cache_key] = {
+            book_signature = book_signature,
+            path = nil,
+            metadata_signature = nil,
+        }
+        return nil
+    end
     
     -- Tenta encontrar um arquivo que exista
-    for _, filename in ipairs(possible_files) do
+    for _, filename in ipairs(METADATA_FILENAMES) do
         local filepath = sdr_path .. "/" .. filename
         local attrs = lfs.attributes(filepath, "mode")
         if attrs == "file" then
+            metadata_file_cache[cache_key] = {
+                book_signature = book_signature,
+                path = filepath,
+                metadata_signature = getFileSignature(filepath),
+            }
             return filepath
         end
     end
@@ -547,18 +637,38 @@ local function findMetadataFile(book_path)
             local filepath = sdr_path .. "/" .. entry
             local attrs = lfs.attributes(filepath, "mode")
             if attrs == "file" then
+                metadata_file_cache[cache_key] = {
+                    book_signature = book_signature,
+                    path = filepath,
+                    metadata_signature = getFileSignature(filepath),
+                }
                 return filepath
             end
         end
     end
-    
+
+    metadata_file_cache[cache_key] = {
+        book_signature = book_signature,
+        path = nil,
+        metadata_signature = nil,
+    }
     return nil
 end
 
 -- Função auxiliar para carregar metadados com pcall
 local function loadMetadata(metadata_path)
+    local signature = getFileSignature(metadata_path)
+    local cached = metadata_cache[metadata_path]
+    if cached and cached.signature == signature then
+        return cached.data
+    end
+
     local ok, metadata = pcall(dofile, metadata_path)
     if not ok or not metadata then return nil end
+    metadata_cache[metadata_path] = {
+        signature = signature,
+        data = metadata,
+    }
     return metadata
 end
 
@@ -572,12 +682,23 @@ local function loadBookHighlights(book_path, include_highlights, include_bookmar
     
     local metadata_path = findMetadataFile(book_path)
     if not metadata_path then return {} end
+
+    local cache_key = table.concat({
+        metadata_path,
+        include_highlights and "1" or "0",
+        include_bookmarks and "1" or "0",
+    }, "|")
+    local metadata_signature = getFileSignature(metadata_path)
+    local cached = highlight_cache[cache_key]
+    if cached and cached.signature == metadata_signature then
+        return cached.data
+    end
     
     -- Tenta carregar os metadados
     local metadata = loadMetadata(metadata_path)
     if not metadata then return {} end
     
-    local highlights = {}
+    local highlights = newArray(16, 0)
     
     -- Método 1: Busca na tabela "highlight" (estrutura antiga/específica)
     if include_highlights and metadata.highlight then
@@ -625,6 +746,10 @@ local function loadBookHighlights(book_path, include_highlights, include_bookmar
         end
     end
     
+    highlight_cache[cache_key] = {
+        signature = metadata_signature,
+        data = highlights,
+    }
     return highlights
 end
 
@@ -642,7 +767,6 @@ local function getRandomHighlight(book_path, max_chars)
     if #highlights == 0 then return nil end
     
     -- Seleciona um highlight aleatório
-    math.randomseed(os.time())
     local random_index = math.random(1, #highlights)
     local selected = highlights[random_index]
     
@@ -678,31 +802,54 @@ local function buildCoverWidget(cover_bb)
     local scaled_bb = RenderImage:scaleBlitBuffer(cover_bb, screen_size.w, screen_size.h, true)
     return ImageWidget:new{
         image = scaled_bb,
+        image_disposable = true,
         width = screen_size.w,
         height = screen_size.h,
         alpha = true,
     }
 end
 
--- Constrói capa a partir do path do arquivo
-local function buildCoverFromPath(file_path)
+local function getCachedCoverBlitbuffer(file_path)
     if not file_path then return nil end
-    
+
+    local screen_size = Screen:getSize()
+    local cache_key = string.format("%s|%dx%d", file_path, screen_size.w, screen_size.h)
+    local file_signature = getFileSignature(file_path)
+    local cached = cover_bb_cache[cache_key]
+    if cached and cached.signature == file_signature then
+        return cached.bb
+    end
+
     local attrs = lfs.attributes(file_path, "mode")
     if attrs ~= "file" then return nil end
-    
-    local DocumentRegistry = require("document/documentregistry")
-    local doc = DocumentRegistry:openDocument(file_path)
-    if not doc then return nil end
-    
-    local cover_bb = nil
-    if doc.getCoverPageImage then
-        local ok, cover = pcall(doc.getCoverPageImage, doc)
-        if ok then cover_bb = cover end
+
+    if not FileManagerBookInfo then
+        FileManagerBookInfo = require("apps/filemanager/filemanagerbookinfo")
     end
-    doc:close()
-    
-    return buildCoverWidget(cover_bb)
+    local cover_bb = FileManagerBookInfo:getCoverImage(nil, file_path)
+    if not cover_bb then
+        return nil
+    end
+
+    local scaled_bb = RenderImage:scaleBlitBuffer(cover_bb, screen_size.w, screen_size.h, true)
+    cover_bb_cache[cache_key] = {
+        signature = file_signature,
+        bb = scaled_bb,
+    }
+    return scaled_bb
+end
+
+-- Constrói capa a partir do path do arquivo
+local function buildCoverFromPath(file_path)
+    local cover_bb = getCachedCoverBlitbuffer(file_path)
+    if not cover_bb then return nil end
+    return ImageWidget:new{
+        image = cover_bb,
+        image_disposable = false,
+        width = Screen:getWidth(),
+        height = Screen:getHeight(),
+        alpha = true,
+    }
 end
 
 -- Constrói o widget estilo Kobo
@@ -710,6 +857,7 @@ local function buildKoboStyleWidget(book_data, ui)
     local TextBoxWidget = require("ui/widget/textboxwidget") -- Importação necessária
     local screen_size = Screen:getSize()
     if not book_data then return nil end
+    local translations = getTranslations()
     
     -- Carregar configurações
     local show_title = isSettingEnabled(SETTINGS.SHOW_TITLE, DEFAULTS.SHOW_TITLE)
@@ -737,7 +885,7 @@ local function buildKoboStyleWidget(book_data, ui)
     local box_border_radius = math.floor(getSetting(SETTINGS.BOX_BORDER_RADIUS, DEFAULTS.BOX_BORDER_RADIUS) * global_scale)
     
     -- Dados do livro
-    local book_title = book_data.title or T("no_title")
+    local book_title = book_data.title or translate(translations, "no_title")
     local chapter_title = book_data.chapter or ""
     local page_no = book_data.page_no or 1
     local page_total = book_data.page_total or 1
@@ -752,7 +900,7 @@ local function buildKoboStyleWidget(book_data, ui)
     -- Tempo restante
     local time_left_str = nil
     if show_time_left and avg_time then
-        time_left_str = formatTimeLeft(avg_time, page_left)
+        time_left_str = formatTimeLeft(avg_time, page_left, translations)
     end
     
     -- Tempo lido hoje
@@ -764,30 +912,29 @@ local function buildKoboStyleWidget(book_data, ui)
         elseif id_book then
             today_duration = getBookTodayDurationById(id_book)
         end
-        today_str = formatDuration(today_duration)
+        today_str = formatDuration(today_duration, translations)
     end
     
     -- Montar texto de progresso
-    local progress_text = string.format(T("percent_read"), percentage)
+    local progress_text = string.format(translate(translations, "percent_read"), percentage)
     if time_left_str then 
-        progress_text = string.format(T("at_percent_time_left"), percentage, time_left_str)
+        progress_text = string.format(translate(translations, "at_percent_time_left"), percentage, time_left_str)
     end
     
     -- Texto de tempo lido hoje
     local today_text = nil
     if today_str then
-        today_text = string.format(T("time_read_today"), today_str)
+        today_text = string.format(translate(translations, "time_read_today"), today_str)
     end
     
     -- Dimensões e espaçamentos (com escala aplicada)
-    local screen_size = Screen:getSize()
     local padding = Screen:scaleBySize(math.floor(12 * global_scale))
     local spacing = Screen:scaleBySize(math.floor(2 * global_scale))
     
     -- Texto de páginas
     local pages_text = nil
     if show_pages then
-        pages_text = string.format(T("page_of"), page_no, page_total)
+        pages_text = string.format(translate(translations, "page_of"), page_no, page_total)
     end
     
     -- Citação aleatória
@@ -822,7 +969,7 @@ local function buildKoboStyleWidget(book_data, ui)
     local quote_face = Font:getFace("cfont", Screen:scaleBySize(font_size_quote))
     
     -- Construir elementos
-    local elements = {}
+    local elements = newArray(8, 0)
     
     -- Título do livro
     if show_title then
@@ -835,23 +982,6 @@ local function buildKoboStyleWidget(book_data, ui)
         })
     end
 
-    -- Citação aleatória (Configuração: Dentro do box principal)
-    local quote_widget = nil
-    if show_quote and quote_data and quote_data.text and quote_data.text ~= "" then
-        -- Calcula largura disponível com margem segura
-        local safe_margin = Screen:scaleBySize(40)
-        local box_max_width = screen_size.w - (safe_margin * 2)
-        
-        quote_widget = TextBoxWidget:new{
-            text = "“" .. quote_data.text .. "”",
-            face = quote_face,
-            fgcolor = text_color_medium,
-            bold = true,
-            width = box_max_width, -- Importante: TextBoxWidget precisa de largura fixa
-            align = "left",
-        }
-    end
-    
     -- Título do capítulo
     if show_chapter and chapter_title ~= "" then
         local chapter_text = utf8Sub(chapter_title, max_chapter_chars)
@@ -927,7 +1057,7 @@ local function buildKoboStyleWidget(book_data, ui)
     
     -- Montar box de citação separado (se houver)
     local quote_box_container = nil
-    if quote_widget then
+    if show_quote and quote_data and quote_data.text and quote_data.text ~= "" then
         -- Calcula largura disponível com margem segura
         local safe_margin = Screen:scaleBySize(40)
         local box_max_width = screen_size.w - (safe_margin * 2)
@@ -945,12 +1075,12 @@ local function buildKoboStyleWidget(book_data, ui)
         table.insert(quote_content, wrapped_quote_widget)
         
         -- Adiciona informações de origem (Capítulo/Página)
-        local source_parts = {}
+        local source_parts = newArray(2, 0)
         if quote_data.chapter and quote_data.chapter ~= "" then
             table.insert(source_parts, quote_data.chapter)
         end
         if quote_data.page then
-            table.insert(source_parts, T("page_prefix") .. " " .. quote_data.page)
+            table.insert(source_parts, translate(translations, "page_prefix") .. " " .. quote_data.page)
         end
         
         if #source_parts > 0 then
